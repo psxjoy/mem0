@@ -4,7 +4,7 @@ import secrets
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -33,15 +33,16 @@ else:
         )
     logging.info("API key authentication enabled")
 
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "postgres")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
-POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
+POSTGRES_HOST = "1"
+POSTGRES_PORT = "2"
+POSTGRES_DB = "3"
+POSTGRES_USER = "4"
+POSTGRES_PASSWORD = "5"
+POSTGRES_COLLECTION_NAME = "6"
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+
+OPENAI_API_KEY ="7"
+OPENAI_BASE_URL = "8"
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -54,11 +55,11 @@ DEFAULT_CONFIG = {
             "user": POSTGRES_USER,
             "password": POSTGRES_PASSWORD,
             "collection_name": POSTGRES_COLLECTION_NAME,
+            "embedding_model_dims": 1024
         },
     },
-    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4.1-nano-2025-04-14"}},
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"}},
-    "history_db_path": HISTORY_DB_PATH,
+    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "qwen3-max", "openai_base_url": OPENAI_BASE_URL}},
+    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY , "model": "text-embedding-v3", "openai_base_url": OPENAI_BASE_URL}}
 }
 
 
@@ -127,6 +128,55 @@ class SearchRequest(BaseModel):
     threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
 
 
+def _is_target_scope_memory(memory: Dict[str, Any], user_id: str, agent_id: Optional[str]) -> bool:
+    if memory.get("user_id") != user_id:
+        return False
+
+    if memory.get("run_id"):
+        return False
+
+    if agent_id is None:
+        return not memory.get("agent_id")
+
+    return memory.get("agent_id") == agent_id
+
+
+def _filter_target_scope_memories(response: Any, user_id: str, agent_id: Optional[str]) -> Any:
+    if isinstance(response, dict) and isinstance(response.get("results"), list):
+        filtered_results = [
+            memory
+            for memory in response["results"]
+            if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id)
+        ]
+
+        return {**response, "results": filtered_results}
+
+    if not isinstance(response, list):
+        return response
+
+    filtered_results = [
+        memory
+        for memory in response
+        if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id)
+    ]
+
+    return filtered_results
+
+
+def _build_memory_filters(
+    *,
+    user_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    memory_filters = dict(filters) if filters else {}
+    for key, value in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items():
+        if value is not None:
+            memory_filters[key] = value
+    return memory_filters
+
+
 @app.post("/configure", summary="Configure Mem0")
 def set_config(config: Dict[str, Any], _api_key: Optional[str] = Depends(verify_api_key)):
     """Set memory configuration."""
@@ -161,12 +211,36 @@ def get_all_memories(
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
     try:
-        params = {
-            k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
-        }
-        return MEMORY_INSTANCE.get_all(**params)
+        return MEMORY_INSTANCE.get_all(filters=_build_memory_filters(user_id=user_id, run_id=run_id, agent_id=agent_id))
     except Exception as e:
         logging.exception("Error in get_all_memories:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/target", summary="Get target-scoped memories")
+def get_target_memories(
+    user_id: str = Query(..., description="User ID whose target-scoped memories should be retrieved."),
+    agent_id: Optional[str] = Query(
+        None, description="Agent ID. When provided, only this agent-level scope is returned."
+    ),
+    top_k: int = Query(20, ge=1, description="Maximum number of memories to inspect."),
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """Retrieve only the requested target scope for a user or user-agent pair."""
+    if not user_id.strip():
+        raise HTTPException(status_code=400, detail="user_id is required.")
+
+    normalized_user_id = user_id.strip()
+    normalized_agent_id = agent_id.strip() if agent_id and agent_id.strip() else None
+    filters = {"user_id": normalized_user_id}
+    if normalized_agent_id:
+        filters["agent_id"] = normalized_agent_id
+
+    try:
+        response = MEMORY_INSTANCE.get_all(filters=filters, top_k=top_k)
+        return _filter_target_scope_memories(response, normalized_user_id, normalized_agent_id)
+    except Exception as e:
+        logging.exception("Error in get_target_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -184,7 +258,17 @@ def get_memory(memory_id: str, _api_key: Optional[str] = Depends(verify_api_key)
 def search_memories(search_req: SearchRequest, _api_key: Optional[str] = Depends(verify_api_key)):
     """Search for memories based on a query."""
     try:
-        params = {k: v for k, v in search_req.model_dump().items() if v is not None and k != "query"}
+        params = {
+            k: v
+            for k, v in search_req.model_dump().items()
+            if v is not None and k not in {"query", "user_id", "run_id", "agent_id", "filters"}
+        }
+        params["filters"] = _build_memory_filters(
+            user_id=search_req.user_id,
+            run_id=search_req.run_id,
+            agent_id=search_req.agent_id,
+            filters=search_req.filters,
+        )
         return MEMORY_INSTANCE.search(query=search_req.query, **params)
     except Exception as e:
         logging.exception("Error in search_memories:")
