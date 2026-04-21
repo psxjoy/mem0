@@ -82,6 +82,10 @@ class TestAuthDisabled:
         resp = self.client.get("/memories", params={"user_id": "alice"})
         assert resp.status_code == 200
 
+    def test_get_target_memories_without_key(self):
+        resp = self.client.get("/target", params={"user_id": "alice"})
+        assert resp.status_code == 200
+
     def test_create_memory_without_key(self):
         resp = self.client.post("/memories", json={
             "messages": [{"role": "user", "content": "I like pizza"}],
@@ -131,6 +135,7 @@ class TestAuthDisabled:
             ("POST", "/configure"),
             ("POST", "/memories"),
             ("GET", "/memories"),
+            ("GET", "/target"),
             ("GET", "/memories/test-id"),
             ("POST", "/search"),
             ("PUT", "/memories/test-id"),
@@ -210,6 +215,7 @@ class TestAuthEnabled:
             ("POST", "/configure"),
             ("POST", "/memories"),
             ("GET", "/memories"),
+            ("GET", "/target"),
             ("GET", "/memories/test-id"),
             ("POST", "/search"),
             ("PUT", "/memories/test-id"),
@@ -229,6 +235,7 @@ class TestAuthEnabled:
             ("POST", "/configure"),
             ("POST", "/memories"),
             ("GET", "/memories"),
+            ("GET", "/target"),
             ("GET", "/memories/test-id"),
             ("POST", "/search"),
             ("PUT", "/memories/test-id"),
@@ -260,6 +267,10 @@ class TestAuthEnabled:
 
     def test_get_all_memories_with_key(self):
         resp = self._authed("GET", "/memories", params={"user_id": "alice"})
+        assert resp.status_code == 200
+
+    def test_get_target_memories_with_key(self):
+        resp = self._authed("GET", "/target", params={"user_id": "alice"})
         assert resp.status_code == 200
 
     def test_create_memory_with_key(self):
@@ -338,7 +349,7 @@ class TestAuthenticatedCRUDFlow:
         # 3. Read all
         resp = self._authed("GET", "/memories", params={"user_id": "alice"})
         assert resp.status_code == 200
-        self.mock.get_all.assert_called_once_with(user_id="alice")
+        self.mock.get_all.assert_called_once_with(filters={"user_id": "alice"})
 
         # 4. Search
         resp = self._authed("POST", "/search", json={"query": "pizza", "user_id": "alice"})
@@ -373,6 +384,7 @@ class TestAuthenticatedCRUDFlow:
             }}),
             ("GET", "/memories/mem-1", {}),
             ("GET", "/memories", {"params": {"user_id": "alice"}}),
+            ("GET", "/target", {"params": {"user_id": "alice"}}),
             ("POST", "/search", {"json": {"query": "pizza", "user_id": "alice"}}),
             ("PUT", "/memories/mem-1", {"json": {"data": "x"}}),
             ("GET", "/memories/mem-1/history", {}),

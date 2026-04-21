@@ -306,9 +306,9 @@ class TestExistingParamsUnchanged:
         })
         assert resp.status_code == 200
         _, kwargs = mock_memory.search.call_args
-        assert kwargs["user_id"] == "u1"
-        assert kwargs["agent_id"] == "a1"
-        assert kwargs["filters"] == {"category": "food"}
+        assert "user_id" not in kwargs
+        assert "agent_id" not in kwargs
+        assert kwargs["filters"] == {"category": "food", "user_id": "u1", "agent_id": "a1"}
 
     def test_add_metadata_still_forwarded(self, client, mock_memory):
         resp = client.post("/memories", json={
@@ -356,6 +356,75 @@ class TestOpenAPISchema:
         schema = client.get("/openapi.json").json()
         add_props = schema["components"]["schemas"]["MemoryCreate"]["properties"]
         assert "prompt" in add_props
+
+    def test_target_endpoint_in_schema(self, client):
+        schema = client.get("/openapi.json").json()
+        assert "/target" in schema["paths"]
+
+
+# ===========================================================================
+# Target-scoped memories
+# ===========================================================================
+
+class TestTargetMemories:
+    """Verify GET /target returns only the requested memory scope."""
+
+    def test_user_target_filters_to_user_level_memories(self, client, mock_memory):
+        mock_memory.get_all.return_value = {
+            "results": [
+                {"id": "user-memory", "memory": "user", "user_id": "alice"},
+                {"id": "agent-memory", "memory": "agent", "user_id": "alice", "agent_id": "coach"},
+                {"id": "run-memory", "memory": "run", "user_id": "alice", "run_id": "run-1"},
+                {"id": "other-user-memory", "memory": "other", "user_id": "bob"},
+            ]
+        }
+
+        resp = client.get("/target", params={"user_id": "alice"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "results": [
+                {"id": "user-memory", "memory": "user", "user_id": "alice"},
+            ]
+        }
+        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice"}, top_k=20)
+
+    def test_agent_target_filters_to_agent_level_memories(self, client, mock_memory):
+        mock_memory.get_all.return_value = {
+            "results": [
+                {"id": "user-memory", "memory": "user", "user_id": "alice"},
+                {"id": "target-agent-memory", "memory": "agent", "user_id": "alice", "agent_id": "coach"},
+                {
+                    "id": "run-memory",
+                    "memory": "run",
+                    "user_id": "alice",
+                    "agent_id": "coach",
+                    "run_id": "run-1",
+                },
+                {"id": "other-agent-memory", "memory": "other", "user_id": "alice", "agent_id": "assistant"},
+            ]
+        }
+
+        resp = client.get("/target", params={"user_id": "alice", "agent_id": "coach", "top_k": 5})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "results": [
+                {"id": "target-agent-memory", "memory": "agent", "user_id": "alice", "agent_id": "coach"},
+            ]
+        }
+        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice", "agent_id": "coach"}, top_k=5)
+
+    def test_target_requires_user_id(self, client):
+        resp = client.get("/target")
+
+        assert resp.status_code == 422
+
+    def test_target_rejects_blank_user_id(self, client):
+        resp = client.get("/target", params={"user_id": "   "})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "user_id is required."
 
 
 # ===========================================================================
@@ -467,7 +536,7 @@ class TestCallSignatureMatch:
         assert resp.status_code == 200
         # The handler passes query= as a keyword arg, so it appears in kwargs too
         _, kwargs = mock_memory.search.call_args
-        valid_params = {"query", "user_id", "agent_id", "run_id", "top_k", "filters", "threshold", "rerank"}
+        valid_params = {"query", "top_k", "filters", "threshold", "rerank"}
         for key in kwargs:
             assert key in valid_params, f"Unexpected kwarg '{key}' forwarded to Memory.search()"
 
