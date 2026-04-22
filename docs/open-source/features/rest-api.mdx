@@ -26,7 +26,7 @@ The Mem0 REST API server exposes every OSS memory operation over HTTP. Run it al
 ## Feature
 
 - **CRUD endpoints:** Create, retrieve, search, update, delete, and reset memories by `user_id`, `agent_id`, or `run_id`.
-- **Target-scoped reads:** Use `/target` to retrieve only user-level memories for a user, or only agent-level memories for a user-agent pair.
+- **Target-scoped reads:** Use `/target` to retrieve user-level, agent-level, or run-level memories.
 - **API key authentication:** Optionally secure all endpoints with a shared API key via the `X-API-Key` header.
 - **Status health check:** Access base routes to confirm the server is online.
 - **OpenAPI explorer:** Visit `/docs` for interactive testing and schema reference.
@@ -180,8 +180,8 @@ The OSS REST server exposes the following endpoints. None use the `/v1/` prefix.
 |--------|------|-------------|
 | `POST` | `/configure` | Set memory configuration |
 | `POST` | `/memories` | Create memories |
-| `GET` | `/memories` | Get all memories (filter by `user_id`, `agent_id`, or `run_id`) |
-| `GET` | `/target` | Get only user-level memories by `user_id`, or agent-level memories by `user_id` and `agent_id` |
+| `GET` | `/memories` | Get memories by `user_id`, `agent_id`, or `run_id` |
+| `GET` | `/target` | Get user-level memories by `user_id`, agent-level memories by `user_id` and `agent_id`, or run-level memories by `run_id` |
 | `GET` | `/memories/{memory_id}` | Get a specific memory |
 | `PUT` | `/memories/{memory_id}` | Update a memory |
 | `DELETE` | `/memories/{memory_id}` | Delete a specific memory |

@@ -360,6 +360,14 @@ class TestOpenAPISchema:
     def test_target_endpoint_in_schema(self, client):
         schema = client.get("/openapi.json").json()
         assert "/target" in schema["paths"]
+        target_params = {param["name"] for param in schema["paths"]["/target"]["get"]["parameters"]}
+        assert "top_k" not in target_params
+        assert "run_id" in target_params
+
+    def test_get_memories_schema_excludes_top_k(self, client):
+        schema = client.get("/openapi.json").json()
+        memory_params = {param["name"] for param in schema["paths"]["/memories"]["get"]["parameters"]}
+        assert "top_k" not in memory_params
 
 
 # ===========================================================================
@@ -387,7 +395,7 @@ class TestTargetMemories:
                 {"id": "user-memory", "memory": "user", "user_id": "alice"},
             ]
         }
-        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice"}, top_k=20)
+        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice"})
 
     def test_agent_target_filters_to_agent_level_memories(self, client, mock_memory):
         mock_memory.get_all.return_value = {
@@ -405,7 +413,7 @@ class TestTargetMemories:
             ]
         }
 
-        resp = client.get("/target", params={"user_id": "alice", "agent_id": "coach", "top_k": 5})
+        resp = client.get("/target", params={"user_id": "alice", "agent_id": "coach"})
 
         assert resp.status_code == 200
         assert resp.json() == {
@@ -413,18 +421,133 @@ class TestTargetMemories:
                 {"id": "target-agent-memory", "memory": "agent", "user_id": "alice", "agent_id": "coach"},
             ]
         }
-        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice", "agent_id": "coach"}, top_k=5)
+        mock_memory.get_all.assert_called_once_with(filters={"user_id": "alice", "agent_id": "coach"})
 
-    def test_target_requires_user_id(self, client):
+    def test_run_target_filters_to_run_level_memories(self, client, mock_memory):
+        mock_memory.get_all.return_value = {
+            "results": [
+                {"id": "user-memory", "memory": "user", "user_id": "alice"},
+                {"id": "target-run-memory", "memory": "run", "user_id": "alice", "run_id": "run-1"},
+                {"id": "agent-run-memory", "memory": "agent-run", "agent_id": "coach", "run_id": "run-1"},
+                {"id": "other-run-memory", "memory": "other", "user_id": "alice", "run_id": "run-2"},
+            ]
+        }
+
+        resp = client.get("/target", params={"run_id": "run-1"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "results": [
+                {"id": "target-run-memory", "memory": "run", "user_id": "alice", "run_id": "run-1"},
+                {"id": "agent-run-memory", "memory": "agent-run", "agent_id": "coach", "run_id": "run-1"},
+            ]
+        }
+        mock_memory.get_all.assert_called_once_with(filters={"run_id": "run-1"})
+
+    def test_run_target_can_be_scoped_by_user_and_agent(self, client, mock_memory):
+        mock_memory.get_all.return_value = {
+            "results": [
+                {
+                    "id": "target-run-memory",
+                    "memory": "run",
+                    "user_id": "alice",
+                    "agent_id": "coach",
+                    "run_id": "run-1",
+                },
+                {"id": "other-agent-memory", "memory": "other", "user_id": "alice", "agent_id": "assistant", "run_id": "run-1"},
+                {"id": "other-user-memory", "memory": "other", "user_id": "bob", "agent_id": "coach", "run_id": "run-1"},
+            ]
+        }
+
+        resp = client.get("/target", params={"user_id": "alice", "agent_id": "coach", "run_id": "run-1"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "results": [
+                {
+                    "id": "target-run-memory",
+                    "memory": "run",
+                    "user_id": "alice",
+                    "agent_id": "coach",
+                    "run_id": "run-1",
+                },
+            ]
+        }
+        mock_memory.get_all.assert_called_once_with(
+            filters={"user_id": "alice", "agent_id": "coach", "run_id": "run-1"}
+        )
+
+    def test_target_falls_back_to_legacy_get_all_signature(self, client, mock_memory):
+        def get_all_side_effect(**kwargs):
+            if "filters" in kwargs:
+                raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be provided.")
+            return {
+                "results": [
+                    {"id": "user-memory", "memory": "user", "user_id": "alice"},
+                    {"id": "agent-memory", "memory": "agent", "user_id": "alice", "agent_id": "coach"},
+                ]
+            }
+
+        mock_memory.get_all.side_effect = get_all_side_effect
+
+        resp = client.get("/target", params={"user_id": "alice"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "results": [
+                {"id": "user-memory", "memory": "user", "user_id": "alice"},
+            ]
+        }
+        assert mock_memory.get_all.call_args_list[0].kwargs == {"filters": {"user_id": "alice"}}
+        assert mock_memory.get_all.call_args_list[1].kwargs == {"user_id": "alice"}
+
+    def test_run_target_falls_back_to_legacy_get_all_signature(self, client, mock_memory):
+        def get_all_side_effect(**kwargs):
+            if "filters" in kwargs:
+                raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be provided.")
+            return {"results": [{"id": "run-memory", "memory": "run", "run_id": kwargs["run_id"]}]}
+
+        mock_memory.get_all.side_effect = get_all_side_effect
+
+        resp = client.get("/target", params={"run_id": "run-1"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {"results": [{"id": "run-memory", "memory": "run", "run_id": "run-1"}]}
+        assert mock_memory.get_all.call_args_list[0].kwargs == {"filters": {"run_id": "run-1"}}
+        assert mock_memory.get_all.call_args_list[1].kwargs == {"run_id": "run-1"}
+
+    def test_get_memories_falls_back_to_legacy_get_all_signature(self, client, mock_memory):
+        def get_all_side_effect(**kwargs):
+            if "filters" in kwargs:
+                raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be provided.")
+            return {"results": [{"id": "user-memory", "memory": "user", "user_id": kwargs["user_id"]}]}
+
+        mock_memory.get_all.side_effect = get_all_side_effect
+
+        resp = client.get("/memories", params={"user_id": "alice"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {"results": [{"id": "user-memory", "memory": "user", "user_id": "alice"}]}
+        assert mock_memory.get_all.call_args_list[0].kwargs == {"filters": {"user_id": "alice"}}
+        assert mock_memory.get_all.call_args_list[1].kwargs == {"user_id": "alice"}
+
+    def test_target_requires_user_id_or_run_id(self, client):
         resp = client.get("/target")
 
-        assert resp.status_code == 422
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "user_id or run_id is required."
 
     def test_target_rejects_blank_user_id(self, client):
         resp = client.get("/target", params={"user_id": "   "})
 
         assert resp.status_code == 400
-        assert resp.json()["detail"] == "user_id is required."
+        assert resp.json()["detail"] == "user_id cannot be blank."
+
+    def test_target_rejects_blank_run_id(self, client):
+        resp = client.get("/target", params={"run_id": "   "})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "run_id cannot be blank."
 
 
 # ===========================================================================
