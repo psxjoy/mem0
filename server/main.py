@@ -128,25 +128,44 @@ class SearchRequest(BaseModel):
     threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
 
 
-def _is_target_scope_memory(memory: Dict[str, Any], user_id: str, agent_id: Optional[str]) -> bool:
-    if memory.get("user_id") != user_id:
+ENTITY_FILTER_KEYS = ("user_id", "agent_id", "run_id")
+
+
+def _is_target_scope_memory(
+    memory: Dict[str, Any],
+    user_id: Optional[str],
+    agent_id: Optional[str],
+    run_id: Optional[str],
+) -> bool:
+    if user_id is not None and memory.get("user_id") != user_id:
         return False
+
+    if agent_id is not None and memory.get("agent_id") != agent_id:
+        return False
+
+    if run_id is not None:
+        return memory.get("run_id") == run_id
 
     if memory.get("run_id"):
         return False
 
-    if agent_id is None:
-        return not memory.get("agent_id")
+    if agent_id is not None:
+        return True
 
-    return memory.get("agent_id") == agent_id
+    return not memory.get("agent_id")
 
 
-def _filter_target_scope_memories(response: Any, user_id: str, agent_id: Optional[str]) -> Any:
+def _filter_target_scope_memories(
+    response: Any,
+    user_id: Optional[str],
+    agent_id: Optional[str],
+    run_id: Optional[str],
+) -> Any:
     if isinstance(response, dict) and isinstance(response.get("results"), list):
         filtered_results = [
             memory
             for memory in response["results"]
-            if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id)
+            if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id, run_id)
         ]
 
         return {**response, "results": filtered_results}
@@ -157,10 +176,62 @@ def _filter_target_scope_memories(response: Any, user_id: str, agent_id: Optiona
     filtered_results = [
         memory
         for memory in response
-        if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id)
+        if isinstance(memory, dict) and _is_target_scope_memory(memory, user_id, agent_id, run_id)
     ]
 
     return filtered_results
+
+
+def _normalize_target_identifier(
+    value: Optional[str],
+    name: str,
+    *,
+    allow_blank: bool = False,
+) -> Optional[str]:
+    if value is None:
+        return None
+
+    normalized_value = value.strip()
+    if normalized_value:
+        return normalized_value
+
+    if allow_blank:
+        return None
+
+    raise HTTPException(status_code=400, detail=f"{name} cannot be blank.")
+
+
+def _split_entity_filters(filters: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    entity_filters = {key: value for key, value in filters.items() if key in ENTITY_FILTER_KEYS}
+    metadata_filters = {key: value for key, value in filters.items() if key not in ENTITY_FILTER_KEYS}
+    return entity_filters, metadata_filters
+
+
+def _is_get_all_compatibility_error(error: Exception) -> bool:
+    message = str(error)
+    return (
+        "unexpected keyword argument 'filters'" in message
+        or "At least one of 'user_id', 'agent_id', or 'run_id' must be provided" in message
+    )
+
+
+def _get_all_memories_legacy(filters: Dict[str, Any]) -> Any:
+    entity_filters, metadata_filters = _split_entity_filters(filters)
+    params = dict(entity_filters)
+    if metadata_filters:
+        params["filters"] = metadata_filters
+
+    return MEMORY_INSTANCE.get_all(**params)
+
+
+def _get_all_memories(filters: Dict[str, Any]) -> Any:
+    try:
+        return MEMORY_INSTANCE.get_all(filters=filters)
+    except Exception as error:
+        if not _is_get_all_compatibility_error(error):
+            raise
+
+    return _get_all_memories_legacy(filters)
 
 
 def _build_memory_filters(
@@ -211,7 +282,7 @@ def get_all_memories(
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
     try:
-        return MEMORY_INSTANCE.get_all(filters=_build_memory_filters(user_id=user_id, run_id=run_id, agent_id=agent_id))
+        return _get_all_memories(filters=_build_memory_filters(user_id=user_id, run_id=run_id, agent_id=agent_id))
     except Exception as e:
         logging.exception("Error in get_all_memories:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -219,26 +290,32 @@ def get_all_memories(
 
 @app.get("/target", summary="Get target-scoped memories")
 def get_target_memories(
-    user_id: str = Query(..., description="User ID whose target-scoped memories should be retrieved."),
+    user_id: Optional[str] = Query(None, description="User ID whose target-scoped memories should be retrieved."),
     agent_id: Optional[str] = Query(
         None, description="Agent ID. When provided, only this agent-level scope is returned."
     ),
-    top_k: int = Query(20, ge=1, description="Maximum number of memories to inspect."),
+    run_id: Optional[str] = Query(None, description="Run ID. When provided, only this run-level scope is returned."),
     _api_key: Optional[str] = Depends(verify_api_key),
 ):
-    """Retrieve only the requested target scope for a user or user-agent pair."""
-    if not user_id.strip():
-        raise HTTPException(status_code=400, detail="user_id is required.")
+    """Retrieve only the requested target scope."""
+    normalized_user_id = _normalize_target_identifier(user_id, "user_id")
+    normalized_agent_id = _normalize_target_identifier(agent_id, "agent_id", allow_blank=True)
+    normalized_run_id = _normalize_target_identifier(run_id, "run_id")
 
-    normalized_user_id = user_id.strip()
-    normalized_agent_id = agent_id.strip() if agent_id and agent_id.strip() else None
-    filters = {"user_id": normalized_user_id}
+    if not normalized_user_id and not normalized_run_id:
+        raise HTTPException(status_code=400, detail="user_id or run_id is required.")
+
+    filters = {}
+    if normalized_user_id:
+        filters["user_id"] = normalized_user_id
     if normalized_agent_id:
         filters["agent_id"] = normalized_agent_id
+    if normalized_run_id:
+        filters["run_id"] = normalized_run_id
 
     try:
-        response = MEMORY_INSTANCE.get_all(filters=filters, top_k=top_k)
-        return _filter_target_scope_memories(response, normalized_user_id, normalized_agent_id)
+        response = _get_all_memories(filters=filters)
+        return _filter_target_scope_memories(response, normalized_user_id, normalized_agent_id, normalized_run_id)
     except Exception as e:
         logging.exception("Error in get_target_memories:")
         raise HTTPException(status_code=500, detail=str(e))
